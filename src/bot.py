@@ -27,6 +27,7 @@ MODE_STORE_PATH = os.getenv("MODE_STORE_PATH", os.path.join(".data", "modes.json
 CWD_STORE_PATH = os.getenv("CWD_STORE_PATH", os.path.join(".data", "cwd.json"))
 ALLOWED_GUILD_IDS = {int(x) for x in os.getenv("ALLOWED_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 ALLOWED_CHANNEL_IDS = {int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
 
 class ModeStore:
@@ -190,6 +191,16 @@ def _is_allowed_location(channel: discord.abc.MessageableChannel, guild: discord
     return True
 
 
+def _is_allowed_user(user: discord.abc.User | discord.Member) -> bool:
+    """If ALLOWED_USER_IDS is non-empty, only those users are allowed."""
+    if not ALLOWED_USER_IDS:
+        return True
+    try:
+        return user.id in ALLOWED_USER_IDS
+    except Exception:
+        return False
+
+
 def user_allowed(interaction: discord.Interaction) -> bool:
     if ALLOW_EVERYONE:
         return True
@@ -312,6 +323,8 @@ async def run_cmd(interaction: discord.Interaction, command: str):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
+    if not _is_allowed_user(interaction.user):
+        return
     if not _is_allowed_location(interaction.channel, interaction.guild):
         # Silently ignore: do not respond in disallowed locations
         return
@@ -338,6 +351,8 @@ async def file_cmd(interaction: discord.Interaction):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
+    if not _is_allowed_user(interaction.user):
+        return
     if not _is_allowed_location(interaction.channel, interaction.guild):
         return
     await interaction.response.send_modal(FileEditModal())
@@ -348,6 +363,8 @@ async def file_cmd(interaction: discord.Interaction):
 async def edit_file_cmd(interaction: discord.Interaction, path: str):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    if not _is_allowed_user(interaction.user):
         return
     if not _is_allowed_location(interaction.channel, interaction.guild):
         return
@@ -385,7 +402,9 @@ async def on_message(message: discord.Message):
         return
     await bot.process_commands(message)
 
-    # Location gating: ignore messages in disallowed servers/channels
+    # User/location gating: ignore messages from disallowed users or locations
+    if not _is_allowed_user(message.author):
+        return
     if not _is_allowed_location(message.channel, message.guild):
         return
 
@@ -467,6 +486,8 @@ async def on_message(message: discord.Message):
 async def cwd_cmd(interaction: discord.Interaction, path: str | None = None):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    if not _is_allowed_user(interaction.user):
         return
     if not _is_allowed_location(interaction.channel, interaction.guild):
         return

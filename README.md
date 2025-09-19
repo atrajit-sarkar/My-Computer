@@ -57,3 +57,4 @@ If your message contains multiple tasks, the bot will try to plan a short, order
 - Multi-step planning: set `CHAT_MAX_STEPS` (default `5`). The bot executes steps sequentially and reports progress.
 - Per-channel working directory: the bot tracks CWD per channel and persists it in `CWD_STORE_PATH`. Use shell `cd`/`Set-Location`, or `/cwd` to view/change. All paths are sandboxed under `WORK_DIR`.
 - Restrict usage by location: set `ALLOWED_GUILD_IDS` and/or `ALLOWED_CHANNEL_IDS` (comma-separated IDs). When set, the bot ignores messages and slash commands outside those servers/channels. If `ALLOWED_GUILD_IDS` is set, slash commands are synced only to those guilds.
+- Restrict usage by user: set `ALLOWED_USER_IDS` (comma-separated user IDs). When set, the bot ignores messages and slash commands from other users.
