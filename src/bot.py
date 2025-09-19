@@ -25,6 +25,8 @@ COMMAND_TIMEOUT_SEC = float(os.getenv("COMMAND_TIMEOUT_SEC", "60"))
 ALLOW_EVERYONE = os.getenv("ALLOW_EVERYONE", "true").lower() == "true"
 MODE_STORE_PATH = os.getenv("MODE_STORE_PATH", os.path.join(".data", "modes.json"))
 CWD_STORE_PATH = os.getenv("CWD_STORE_PATH", os.path.join(".data", "cwd.json"))
+ALLOWED_GUILD_IDS = {int(x) for x in os.getenv("ALLOWED_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+ALLOWED_CHANNEL_IDS = {int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
 
 class ModeStore:
@@ -168,6 +170,26 @@ def _channel_key_from_obj(ch: discord.abc.MessageableChannel | discord.Thread) -
         return getattr(ch, "id", 0)
 
 
+def _is_allowed_location(channel: discord.abc.MessageableChannel, guild: discord.Guild | None) -> bool:
+    """Return True if this channel/guild is allowed by env settings.
+
+    Rules:
+    - If ALLOWED_GUILD_IDS is non-empty, guild must be in the set (DMs disallowed in that case).
+    - If ALLOWED_CHANNEL_IDS is non-empty, the channel key (parent id for threads) must be in the set.
+    - If a set is empty, it doesn't restrict that dimension.
+    """
+    # Guild restriction
+    if ALLOWED_GUILD_IDS:
+        if guild is None or guild.id not in ALLOWED_GUILD_IDS:
+            return False
+    # Channel restriction
+    if ALLOWED_CHANNEL_IDS:
+        key = _channel_key_from_obj(channel)
+        if key not in ALLOWED_CHANNEL_IDS:
+            return False
+    return True
+
+
 def user_allowed(interaction: discord.Interaction) -> bool:
     if ALLOW_EVERYONE:
         return True
@@ -241,8 +263,17 @@ class EditExistingFileModal(discord.ui.Modal, title="Edit File"):
 async def on_ready():
     osinfo = detect_os()
     try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands. Running on {osinfo.name} shell {osinfo.shell}")
+        if ALLOWED_GUILD_IDS:
+            # Clear global commands and sync only to allowed guilds
+            tree.clear_commands(guild=None)
+            total = 0
+            for gid in ALLOWED_GUILD_IDS:
+                synced = await tree.sync(guild=discord.Object(id=gid))
+                total += len(synced)
+            print(f"Synced guild commands to {len(ALLOWED_GUILD_IDS)} guild(s), total {total} cmds. OS {osinfo.name} shell {osinfo.shell}")
+        else:
+            synced = await tree.sync()
+            print(f"Synced {len(synced)} global commands. OS {osinfo.name} shell {osinfo.shell}")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
@@ -281,13 +312,18 @@ async def run_cmd(interaction: discord.Interaction, command: str):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
+    if not _is_allowed_location(interaction.channel, interaction.guild):
+        # Silently ignore: do not respond in disallowed locations
+        return
     await interaction.response.defer(thinking=True, ephemeral=True)
+    # Use stable channel key (parent channel for threads)
+    key = _channel_key_from_obj(interaction.channel)
     # Update CWD if command is a cd/Set-Location; possibly run remainder
-    remainder, changed = _preprocess_command_for_cwd(interaction.channel_id, command, detect_os().is_windows)
+    remainder, changed = _preprocess_command_for_cwd(key, command, detect_os().is_windows)
     if changed and not remainder:
         await interaction.followup.send(changed, ephemeral=True)
         return
-    work_dir = cwd_store.get(interaction.channel_id)
+    work_dir = cwd_store.get(key)
     result = await run_command(remainder or command, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
     msg = f"$ {command}\nexit={result.exit_code}\n"
     if result.stdout:
@@ -302,6 +338,8 @@ async def file_cmd(interaction: discord.Interaction):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
+    if not _is_allowed_location(interaction.channel, interaction.guild):
+        return
     await interaction.response.send_modal(FileEditModal())
 
 
@@ -310,6 +348,8 @@ async def file_cmd(interaction: discord.Interaction):
 async def edit_file_cmd(interaction: discord.Interaction, path: str):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    if not _is_allowed_location(interaction.channel, interaction.guild):
         return
     rel_path = path.strip()
     base = os.path.abspath(WORK_DIR)
@@ -345,6 +385,10 @@ async def on_message(message: discord.Message):
         return
     await bot.process_commands(message)
 
+    # Location gating: ignore messages in disallowed servers/channels
+    if not _is_allowed_location(message.channel, message.guild):
+        return
+
     # Handle chat-mode messages
     if message.guild is None:
         # For simplicity, process DMs as default mode
@@ -357,61 +401,35 @@ async def on_message(message: discord.Message):
         content = message.content.strip()
         if not content:
             return
+        key = _channel_key_from_obj(message.channel)
         if modev == "command":
-            command = content
-        else:
-            # chat mode -> convert to command using Gemini
-            style = CommandStyle.POWERSHELL if detect_os().is_windows else CommandStyle.BASH
-            # Try multi-step plan first
-            max_steps = int(os.getenv("CHAT_MAX_STEPS", "5"))
-            commands = await to_commands_from_nl(content, style, max_steps=max_steps)
-            if len(commands) <= 1:
-                command = commands[0]
-                # Allow channel-local cd
-                remainder, changed = _preprocess_command_for_cwd(message.channel.id, command, detect_os().is_windows)
-                if changed and not remainder:
-                    await message.channel.send(changed)
-                    return
-                work_dir = cwd_store.get(message.channel.id)
-                result = await run_command(remainder or command, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
-                os_line = f"OS: {detect_os().name}\n"
-                msg = f"{os_line}$ {command}\nexit={result.exit_code}\n"
-                if result.stdout:
-                    msg += f"stdout:\n{summarize_output(result.stdout)}\n"
-                if result.stderr:
-                    msg += f"stderr:\n{summarize_output(result.stderr)}"
-                await message.channel.send(msg)
-            else:
-                # Execute sequentially with progress updates
-                await message.channel.send(f"Planning {len(commands)} step(s). Executing sequentially…")
-                os_name = detect_os().name
-                for idx, cmd in enumerate(commands, start=1):
-                    # Apply cd handling per step
-                    remainder, changed = _preprocess_command_for_cwd(message.channel.id, cmd, detect_os().is_windows)
-                    if changed and not remainder:
-                        await message.channel.send(f"[{idx}/{len(commands)}] {changed}")
-                        continue
-                    await message.channel.send(f"[{idx}/{len(commands)}] $ {cmd}")
-                    work_dir = cwd_store.get(message.channel.id)
-                    result = await run_command(remainder or cmd, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
-                    msg = f"OS: {os_name}\nexit={result.exit_code}\n"
-                    if result.stdout:
-                        msg += f"stdout:\n{summarize_output(result.stdout)}\n"
-                    if result.stderr:
-                        msg += f"stderr:\n{summarize_output(result.stderr)}"
-                    await message.channel.send(msg)
-                    if result.exit_code != 0:
-                        await message.channel.send(f"Stopped due to error at step {idx}.")
-                        break
-                return
-
-        if modev == "command":
-            # run the single command for command mode here
-            remainder, changed = _preprocess_command_for_cwd(message.channel.id, command, detect_os().is_windows)
+            # Strict command mode: never call Gemini, run raw input
+            remainder, changed = _preprocess_command_for_cwd(key, content, detect_os().is_windows)
             if changed and not remainder:
                 await message.channel.send(changed)
                 return
-            work_dir = cwd_store.get(message.channel.id)
+            work_dir = cwd_store.get(key)
+            result = await run_command(remainder or content, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
+            os_line = f"OS: {detect_os().name}\n"
+            msg = f"{os_line}$ {content}\nexit={result.exit_code}\n"
+            if result.stdout:
+                msg += f"stdout:\n{summarize_output(result.stdout)}\n"
+            if result.stderr:
+                msg += f"stderr:\n{summarize_output(result.stderr)}"
+            await message.channel.send(msg)
+            return
+
+        # chat mode -> convert to commands using Gemini
+        style = CommandStyle.POWERSHELL if detect_os().is_windows else CommandStyle.BASH
+        max_steps = int(os.getenv("CHAT_MAX_STEPS", "5"))
+        commands = await to_commands_from_nl(content, style, max_steps=max_steps)
+        if len(commands) <= 1:
+            command = commands[0]
+            remainder, changed = _preprocess_command_for_cwd(key, command, detect_os().is_windows)
+            if changed and not remainder:
+                await message.channel.send(changed)
+                return
+            work_dir = cwd_store.get(key)
             result = await run_command(remainder or command, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
             os_line = f"OS: {detect_os().name}\n"
             msg = f"{os_line}$ {command}\nexit={result.exit_code}\n"
@@ -420,6 +438,28 @@ async def on_message(message: discord.Message):
             if result.stderr:
                 msg += f"stderr:\n{summarize_output(result.stderr)}"
             await message.channel.send(msg)
+            return
+        else:
+            await message.channel.send(f"Planning {len(commands)} step(s). Executing sequentially…")
+            os_name = detect_os().name
+            for idx, cmd in enumerate(commands, start=1):
+                remainder, changed = _preprocess_command_for_cwd(key, cmd, detect_os().is_windows)
+                if changed and not remainder:
+                    await message.channel.send(f"[{idx}/{len(commands)}] {changed}")
+                    continue
+                await message.channel.send(f"[{idx}/{len(commands)}] $ {cmd}")
+                work_dir = cwd_store.get(key)
+                result = await run_command(remainder or cmd, work_dir=work_dir, timeout=COMMAND_TIMEOUT_SEC)
+                msg = f"OS: {os_name}\nexit={result.exit_code}\n"
+                if result.stdout:
+                    msg += f"stdout:\n{summarize_output(result.stdout)}\n"
+                if result.stderr:
+                    msg += f"stderr:\n{summarize_output(result.stderr)}"
+                await message.channel.send(msg)
+                if result.exit_code != 0:
+                    await message.channel.send(f"Stopped due to error at step {idx}.")
+                    break
+            return
 
 
 @tree.command(name="cwd", description="Show or change the current working directory for this channel")
@@ -428,14 +468,17 @@ async def cwd_cmd(interaction: discord.Interaction, path: str | None = None):
     if not user_allowed(interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
+    if not _is_allowed_location(interaction.channel, interaction.guild):
+        return
+    key = _channel_key_from_obj(interaction.channel)
     if path is None:
-        cur = cwd_store.get(interaction.channel_id)
+        cur = cwd_store.get(key)
         rel = os.path.relpath(cur, os.path.abspath(WORK_DIR))
         await interaction.response.send_message(f"Current directory: `{rel}`", ephemeral=True)
         return
-    target = _resolve_cd_target(interaction.channel_id, path)
+    target = _resolve_cd_target(key, path)
     try:
-        newd = cwd_store.set(interaction.channel_id, target)
+        newd = cwd_store.set(key, target)
         rel = os.path.relpath(newd, os.path.abspath(WORK_DIR))
         await interaction.response.send_message(f"Changed directory to `{rel}`", ephemeral=True)
     except Exception as e:
